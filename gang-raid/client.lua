@@ -1,309 +1,392 @@
 -- =============================================
--- GANG HIDEOUT RAID | client.lua  v3.0
--- Guards are spawned SERVER-SIDE (synced).
--- This client only:
---   1. Resolves netId → local entity handle
---   2. Sets relationship groups + combat tasks
---   3. Manages blip, loot crates, and UI
--- Compatible: QBCore/QBox | qb-target/ox_target
+-- GANG HIDEOUT RAID | client.lua  v5.0
+-- Supports: qb-target / ox_target (auto-detect)
+--           QBCore / QBox / ox_lib notify
 -- =============================================
 
-local QBCore       = nil
-local lootedCrates = {}
-local activeBlip   = nil
-local raidActive   = false
-local targetExport = nil
+local QBCore             = nil
+local lootedCrates       = {}
+local spawnedGuards      = {}   -- { ped = handle, looted = bool }
+local lootedGuards       = {}   -- [ped handle] = true
+local activeLocation     = nil
+local activeBlip         = nil
+local lootMonitorRunning = false
+
+-- Init QBCore if available
+local ok, obj = pcall(function() return exports['qb-core']:GetCoreObject() end)
+if ok and obj then QBCore = obj end
 
 -- =============================================
--- FRAMEWORK INIT
--- =============================================
-CreateThread(function()
-    Wait(200)
-    local ok, obj = pcall(function() return exports['qb-core']:GetCoreObject() end)
-    if ok and obj then QBCore = obj end
-
-    -- Detect target system
-    local oxOk = pcall(function() return exports['ox_target'] end)
-    if Config.TargetExport == 'ox_target' or (Config.TargetExport == 'auto' and oxOk) then
-        targetExport = 'ox_target'
-    else
-        targetExport = 'qb-target'
-    end
-end)
-
--- =============================================
--- HELPERS
+-- NOTIFY HELPER
 -- =============================================
 local function Notify(msg, ntype)
     ntype = ntype or 'primary'
     if QBCore then
         QBCore.Functions.Notify(msg, ntype)
-    else
-        local ok = pcall(function() lib.notify({ title = msg, type = ntype }) end)
-        if not ok then
-            SetNotificationTextEntry('STRING')
-            AddTextComponentString(msg)
-            DrawNotification(false, false)
-        end
+    elseif GetResourceState('ox_lib') == 'started' then
+        exports['ox_lib']:notify({ description = msg, type = ntype })
     end
 end
 
-local function AddTargetEntity(entity, options, distance)
-    if targetExport == 'ox_target' then
-        exports['ox_target']:addLocalEntity(entity, options)
+-- =============================================
+-- TARGET COMPATIBILITY LAYER
+-- =============================================
+local TargetLib = nil
+
+local function GetTargetLib()
+    if TargetLib and TargetLib ~= 'none' then return TargetLib end
+    local cfg = Config.TargetExport
+    if cfg == 'ox_target' or (cfg == 'auto' and GetResourceState('ox_target') == 'started') then
+        TargetLib = 'ox_target'
+    elseif cfg == 'qb-target' or (cfg == 'auto' and GetResourceState('qb-target') == 'started') then
+        TargetLib = 'qb-target'
     else
-        exports['qb-target']:AddTargetEntity(entity, { options = options, distance = distance or 2.0 })
+        TargetLib = 'none'
+    end
+    if Config.Debug then print('[gang-raid] Target lib: ' .. TargetLib) end
+    return TargetLib
+end
+
+local function WaitForTargetLib()
+    local attempts = 0
+    while GetTargetLib() == 'none' and attempts < 40 do
+        Wait(500)
+        attempts = attempts + 1
+    end
+    if TargetLib == 'none' then
+        print('^1[gang-raid] ERROR: No target resource found. Ensure qb-target or ox_target starts before gang-raid.^7')
     end
 end
 
-local function RemoveTargetEntity(entity)
-    if targetExport == 'ox_target' then
+local function AddEntityTarget(entity, label, icon, distance, action)
+    local lib = GetTargetLib()
+    if lib == 'ox_target' then
+        exports['ox_target']:addLocalEntity(entity, {
+            {
+                name     = 'gr_' .. tostring(entity),
+                label    = label,
+                icon     = icon,
+                distance = distance,
+                onSelect = action,
+            }
+        })
+    elseif lib == 'qb-target' then
+        exports['qb-target']:AddTargetEntity(entity, {
+            options  = { { label = label, icon = icon, action = action } },
+            distance = distance,
+        })
+    end
+end
+
+local function RemoveEntityTarget(entity)
+    local lib = GetTargetLib()
+    if lib == 'ox_target' then
         exports['ox_target']:removeLocalEntity(entity)
-    else
+    elseif lib == 'qb-target' then
         exports['qb-target']:RemoveTargetEntity(entity)
     end
 end
 
-local function LoadModel(model)
-    local hash = type(model) == 'number' and model or GetHashKey(model)
-    if not IsModelValid(hash) then return nil end
-    RequestModel(hash)
-    local timeout = 0
-    while not HasModelLoaded(hash) do
-        Wait(100)
-        timeout = timeout + 100
-        if timeout > 10000 then
-            if Config.Debug then print('[GHR CLIENT] Model timeout: ' .. tostring(model)) end
-            return nil
-        end
-    end
-    return hash
+-- =============================================
+-- GUARD RELATIONSHIPS
+-- GTA relationship groups are client-local, so
+-- this must run on every player's machine.
+-- =============================================
+local function SetupGuardRelationships()
+    local groupName   = "HIDEOUT_GUARDS"
+    local groupHash   = GetHashKey(groupName)
+    local playerGroup = GetHashKey("PLAYER")
+
+    AddRelationshipGroup(groupName)
+    SetRelationshipBetweenGroups(5, groupHash, playerGroup)
+    SetRelationshipBetweenGroups(5, playerGroup, groupHash)
+    SetRelationshipBetweenGroups(5, groupHash, GetHashKey("CIVMALE"))
+    SetRelationshipBetweenGroups(5, groupHash, GetHashKey("CIVFEMALE"))
+
+    return groupHash
 end
 
 -- =============================================
--- BLIP
+-- APPLY COMBAT SETTINGS
+-- Combat attribute 14 = attack player on sight
+-- Combat attribute 52 = attack when spotted
+-- SetPedAlertness(3)  = fully combat-alerted
+-- These three together make guards shoot first.
 -- =============================================
-local function CreateRaidBlip(blipData)
+local function ApplyCombatSettings(ped, groupHash)
+    SetPedRelationshipGroupHash(ped, groupHash)
+    SetPedAsEnemy(ped, true)
+    SetPedAlertness(ped, 3)
+
+    SetPedCombatAttributes(ped, 0,  true)
+    SetPedCombatAttributes(ped, 2,  true)
+    SetPedCombatAttributes(ped, 5,  true)
+    SetPedCombatAttributes(ped, 14, true)  -- attack player on sight (KEY)
+    SetPedCombatAttributes(ped, 17, true)
+    SetPedCombatAttributes(ped, 46, true)
+    SetPedCombatAttributes(ped, 52, true)  -- attack when spotted (KEY)
+
+    SetPedCombatRange(ped, 2)
+    SetPedCombatAbility(ped, 2)
+    SetPedCombatMovement(ped, 2)
+
+    SetBlockingOfNonTemporaryEvents(ped, true)
+    SetPedFleeAttributes(ped, 0, false)
+    SetPedDiesWhenInjured(ped, false)
+
+    TaskCombatHatedTargetsAroundPed(ped, 60.0, 0)
+end
+
+-- =============================================
+-- LOOT MONITOR
+-- Watches spawnedGuards every second for newly
+-- dead peds, then adds a Search Body target.
+-- =============================================
+local function StartLootMonitor()
+    if lootMonitorRunning then return end
+    lootMonitorRunning = true
+
+    CreateThread(function()
+        while lootMonitorRunning do
+            Wait(1000)
+
+            for _, entry in ipairs(spawnedGuards) do
+                local ped = entry.ped
+                if not entry.looted
+                and DoesEntityExist(ped)
+                and IsEntityDead(ped)
+                and not lootedGuards[ped] then
+
+                    lootedGuards[ped] = true
+                    entry.looted      = true
+
+                    local p = ped
+                    SetTimeout(1500, function()
+                        if not DoesEntityExist(p) then return end
+                        AddEntityTarget(p, "Search Body", "fas fa-search", 1.5, function(entity)
+                            RemoveEntityTarget(entity)
+                            TriggerServerEvent("gang_hideout:lootGuard")
+                        end)
+                    end)
+                end
+            end
+        end
+    end)
+end
+
+-- =============================================
+-- RAID STARTED — fires on ALL clients
+-- =============================================
+RegisterNetEvent('gang_hideout:raidStarted', function(locationIndex)
+    lootedCrates       = {}
+    lootedGuards       = {}
+    spawnedGuards      = {}
+    lootMonitorRunning = false
+    activeLocation     = Config.Locations[locationIndex]
+
     if activeBlip then RemoveBlip(activeBlip) end
-    activeBlip = AddBlipForCoord(blipData.coords.x, blipData.coords.y, blipData.coords.z)
-    SetBlipSprite(activeBlip, blipData.sprite)
-    SetBlipScale(activeBlip, blipData.scale)
-    SetBlipColour(activeBlip, blipData.color)
+    local b    = activeLocation.blip
+    activeBlip = AddBlipForCoord(b.coords)
+    SetBlipSprite(activeBlip, b.sprite)
+    SetBlipScale(activeBlip, b.scale)
+    SetBlipColour(activeBlip, b.color)
     SetBlipDisplay(activeBlip, 4)
     SetBlipAsShortRange(activeBlip, false)
-    SetBlipFlashes(activeBlip, true)
-    BeginTextCommandSetBlipName('STRING')
-    AddTextComponentString(blipData.label)
+    BeginTextCommandSetBlipName("STRING")
+    AddTextComponentString(b.label)
     EndTextCommandSetBlipName(activeBlip)
-end
 
--- =============================================
--- LOOT CRATES  (client-local props are fine —
--- only the server loot event is authoritative)
--- =============================================
-local function SpawnLootCrates(crateCoords)
-    lootedCrates = {}
-
-    for i, coords in ipairs(crateCoords) do
-        local crateId = 'crate_' .. i
-        local hash    = `prop_box_wood01a`
-        RequestModel(hash)
-        local t = 0
-        while not HasModelLoaded(hash) do
-            Wait(100); t = t + 100
-            if t > 5000 then break end
-        end
-
-        local obj = CreateObject(hash, coords.x, coords.y, coords.z, true, true, true)
+    for i, coords in pairs(activeLocation.lootCrates) do
+        local crateId = "crate_" .. i
+        local obj     = CreateObject(GetHashKey('prop_box_wood01a'), coords.x, coords.y, coords.z, true, true, true)
         SetEntityAsMissionEntity(obj, true, true)
         FreezeEntityPosition(obj, true)
         PlaceObjectOnGroundProperly(obj)
-        SetModelAsNoLongerNeeded(hash)
 
-        local capturedObj     = obj
-        local capturedCrateId = crateId
-
-        local function OnSearch(entity)
-            if lootedCrates[capturedCrateId] then
-                Notify('This crate is already empty.', 'error')
+        AddEntityTarget(obj, "Search Crate", "fas fa-box-open", 2.0, function(entity)
+            if lootedCrates[crateId] then
+                Notify("This crate is already empty.", "error")
                 return
             end
-            lootedCrates[capturedCrateId] = true
-            TriggerServerEvent('gang_hideout:giveLoot')
-            RemoveTargetEntity(entity or capturedObj)
-            if DoesEntityExist(capturedObj) then DeleteEntity(capturedObj) end
+            lootedCrates[crateId] = true
+            TriggerServerEvent("gang_hideout:giveLoot")
+            RemoveEntityTarget(entity)
+            DeleteEntity(entity)
+        end)
+    end
+
+    if Config.Debug then print('[gang-raid] Raid started at: ' .. activeLocation.name) end
+end)
+
+-- =============================================
+-- SPAWN WAVE — raid-starter client only
+-- =============================================
+RegisterNetEvent('gang_hideout:spawnWave', function(guards, waveNum)
+    local groupHash = SetupGuardRelationships()
+    spawnedGuards   = {}
+    local netIds    = {}
+
+    for _, guard in pairs(guards) do
+        local model = GetHashKey(guard.model)
+        RequestModel(model)
+        while not HasModelLoaded(model) do Wait(0) end
+
+        local ped = CreatePed(4, model,
+            guard.coords.x, guard.coords.y, guard.coords.z, guard.coords.w,
+            true, true)
+
+        SetEntityAsMissionEntity(ped, true, true)
+        NetworkRegisterEntityAsNetworked(ped)
+
+        GiveWeaponToPed(ped, GetHashKey(guard.weapon), 200, true, true)
+        SetPedArmour(ped, guard.armor    or 100)
+        SetPedAccuracy(ped, guard.accuracy or 70)
+
+        ApplyCombatSettings(ped, groupHash)
+        SetModelAsNoLongerNeeded(model)
+
+        table.insert(spawnedGuards, { ped = ped, looted = false })
+
+        local timeout = 0
+        while (not NetworkGetNetworkIdFromEntity(ped) or NetworkGetNetworkIdFromEntity(ped) == 0) do
+            Wait(50)
+            timeout = timeout + 50
+            if timeout > 3000 then break end
         end
 
-        local options = {
-            {
-                name     = 'ghr_search_' .. crateId,
-                label    = 'Search Crate',
-                icon     = 'fas fa-box-open',
-                distance = 2.0,
-                onSelect = function(data)  -- ox_target
-                    OnSearch(data and data.entity)
-                end,
-                action   = function(entity) -- qb-target
-                    OnSearch(entity)
-                end,
-            }
-        }
-
-        AddTargetEntity(obj, options, 2.0)
+        local netId = NetworkGetNetworkIdFromEntity(ped)
+        if netId and netId ~= 0 then
+            table.insert(netIds, netId)
+        end
     end
-end
+
+    TriggerServerEvent('gang_hideout:waveSpawned', netIds)
+    StartLootMonitor()
+    Notify('Wave ' .. waveNum .. ' — enemies inbound!', 'error')
+
+    if Config.Debug then print('[gang-raid] Wave ' .. waveNum .. ' spawned ' .. #netIds .. ' peds.') end
+end)
 
 -- =============================================
--- START NPC  (spawned locally — cosmetic only)
+-- CONFIGURE PEDS — ALL clients
+-- =============================================
+RegisterNetEvent('gang_hideout:configurePeds', function(netIds)
+    Wait(800)
+    local groupHash = SetupGuardRelationships()
+
+    for _, netId in ipairs(netIds) do
+        if NetworkDoesEntityExistWithNetworkId(netId) then
+            local ped = NetworkGetEntityFromNetworkId(netId)
+            if DoesEntityExist(ped) and not IsPedAPlayer(ped) then
+                ApplyCombatSettings(ped, groupHash)
+
+                local alreadyTracked = false
+                for _, entry in ipairs(spawnedGuards) do
+                    if entry.ped == ped then alreadyTracked = true break end
+                end
+                if not alreadyTracked then
+                    table.insert(spawnedGuards, { ped = ped, looted = false })
+                end
+            end
+        end
+    end
+
+    StartLootMonitor()
+end)
+
+-- =============================================
+-- SPAWN ESCAPE VEHICLE — raid-starter client only
+-- =============================================
+RegisterNetEvent('gang_hideout:spawnEscapeVehicle', function(vehicleData)
+    if not Config.EscapeVehicleEnabled then return end
+
+    local model = GetHashKey(vehicleData.model)
+    RequestModel(model)
+    while not HasModelLoaded(model) do Wait(0) end
+
+    local veh = CreateVehicle(model,
+        vehicleData.coords.x, vehicleData.coords.y,
+        vehicleData.coords.z, vehicleData.coords.w,
+        true, true)
+    SetEntityAsMissionEntity(veh, true, true)
+    NetworkRegisterEntityAsNetworked(veh)
+    SetModelAsNoLongerNeeded(model)
+
+    local driverModelName = (activeLocation
+        and activeLocation.waves
+        and activeLocation.waves[1]
+        and activeLocation.waves[1][1]
+        and activeLocation.waves[1][1].model)
+        or 'g_m_y_ballasout_01'
+
+    local driverModel = GetHashKey(driverModelName)
+    RequestModel(driverModel)
+    while not HasModelLoaded(driverModel) do Wait(0) end
+
+    local driver = CreatePedInsideVehicle(veh, 4, driverModel, -1, true, true)
+    SetEntityAsMissionEntity(driver, true, true)
+    NetworkRegisterEntityAsNetworked(driver)
+    GiveWeaponToPed(driver, GetHashKey('WEAPON_ASSAULTRIFLE'), 200, true, true)
+    SetPedArmour(driver, 200)
+
+    local timeout = 0
+    while (not NetworkGetNetworkIdFromEntity(driver) or NetworkGetNetworkIdFromEntity(driver) == 0) do
+        Wait(50)
+        timeout = timeout + 50
+        if timeout > 3000 then break end
+    end
+
+    local driverNetId = NetworkGetNetworkIdFromEntity(driver)
+    SetModelAsNoLongerNeeded(driverModel)
+    TriggerServerEvent('gang_hideout:escapeVehicleSpawned', driverNetId)
+end)
+
+-- =============================================
+-- DRIVE ESCAPE VEHICLE — all clients
+-- =============================================
+RegisterNetEvent('gang_hideout:driveEscapeVehicle', function(driverNetId, x, y, z)
+    Wait(500)
+    if not NetworkDoesEntityExistWithNetworkId(driverNetId) then return end
+    local driver = NetworkGetEntityFromNetworkId(driverNetId)
+    if not DoesEntityExist(driver) then return end
+    local veh = GetVehiclePedIsIn(driver, false)
+    if DoesEntityExist(veh) then
+        TaskVehicleDriveToCoordLongrange(driver, veh, x, y, z, 30.0, 786603, 20.0)
+    end
+end)
+
+-- =============================================
+-- RAID FINISHED — all clients
+-- =============================================
+RegisterNetEvent('gang_hideout:raidFinished', function()
+    lootMonitorRunning = false
+    if activeBlip then RemoveBlip(activeBlip) activeBlip = nil end
+    Notify('Gang hideout cleared! Check your inventory for your bonus.', 'success')
+    TriggerServerEvent('gang_hideout:claimBonus')
+    activeLocation = nil
+end)
+
+-- =============================================
+-- START NPC — always present in world
 -- =============================================
 CreateThread(function()
-    Wait(1500)
-    local npc  = Config.StartRaidNPC
-    local hash = LoadModel(npc.model)
-    if not hash then return end
+    WaitForTargetLib()
 
-    local ped = CreatePed(4, hash,
-        npc.coords.x, npc.coords.y, npc.coords.z - 1.0, npc.coords.w,
+    local npc   = Config.StartRaidNPC
+    local model = GetHashKey(npc.model)
+    RequestModel(model)
+    while not HasModelLoaded(model) do Wait(0) end
+
+    local ped = CreatePed(0, model,
+        npc.coords.x, npc.coords.y, npc.coords.z - 1, npc.coords.w,
         false, true)
+
     SetEntityInvincible(ped, true)
     SetBlockingOfNonTemporaryEvents(ped, true)
     FreezeEntityPosition(ped, true)
-    SetModelAsNoLongerNeeded(hash)
+    SetModelAsNoLongerNeeded(model)
 
-    local options = {
-        {
-            name     = 'ghr_start_raid',
-            label    = npc.targetLabel,
-            icon     = 'fas fa-skull-crossbones',
-            distance = 2.5,
-            onSelect = function()   -- ox_target
-                if raidActive then Notify('A raid is already in progress!', 'error'); return end
-                TriggerServerEvent('gang_hideout:startRaid')
-            end,
-            action = function()     -- qb-target
-                if raidActive then Notify('A raid is already in progress!', 'error'); return end
-                TriggerServerEvent('gang_hideout:startRaid')
-            end,
-        }
-    }
-
-    AddTargetEntity(ped, options, 2.5)
-end)
-
--- =============================================
--- NET EVENT: RAID STARTED
--- Server picks the location — clients show blip
--- and spawn crate props locally.
--- =============================================
-RegisterNetEvent('gang_hideout:raidStarted', function(locationIndex)
-    if raidActive then return end
-    raidActive = true
-
-    local location = Config.Locations[locationIndex]
-    if not location then return end
-
-    Notify('🚨 Gang Hideout Raid started at ' .. location.name .. '!', 'error')
-    CreateRaidBlip(location.blip)
-    SpawnLootCrates(location.lootCrates)
-end)
-
--- =============================================
--- NET EVENT: CONFIGURE PEDS
--- Server sends us the netIds of freshly spawned
--- peds. We resolve them to local handles and
--- apply relationship groups + combat tasks,
--- which MUST run client-side.
--- =============================================
-RegisterNetEvent('gang_hideout:configurePeds', function(netIdList)
-    -- Give the engine a moment to replicate the entities before we look them up
-    Wait(1000)
-
-    -- Set up hostile relationship group once
-    local groupHash  = GetHashKey('HIDEOUT_GUARDS')
-    local playerHash = GetHashKey('PLAYER')
-    if not HasRelationshipGroupWithHash(groupHash) then
-        AddRelationshipGroup('HIDEOUT_GUARDS')
-    end
-    SetRelationshipBetweenGroups(5, groupHash, playerHash)  -- hate
-    SetRelationshipBetweenGroups(5, playerHash, groupHash)
-
-    for _, entry in ipairs(netIdList) do
-        -- Wait until this net entity exists locally (up to 5 seconds)
-        local ped     = nil
-        local timeout = 0
-        repeat
-            Wait(200)
-            timeout = timeout + 200
-            if NetworkDoesNetworkIdExist(entry.netId) then
-                ped = NetworkGetEntityFromNetworkId(entry.netId)
-            end
-        until (ped and DoesEntityExist(ped)) or timeout > 5000
-
-        if ped and DoesEntityExist(ped) then
-            SetPedRelationshipGroupHash(ped, groupHash)
-            SetPedAsEnemy(ped, true)
-            SetPedAccuracy(ped, entry.accuracy or 70)
-            SetPedCombatAttributes(ped, 46, true)   -- canFightArmedPedsWhenNotArmed
-            SetPedCombatAttributes(ped, 5,  true)   -- canUseCover
-            SetPedCombatRange(ped, 2)               -- far
-            SetPedCombatAbility(ped, 2)             -- professional
-            SetPedCombatMovement(ped, 2)            -- advance
-            TaskCombatHatedTargetsAroundPed(ped, 80.0, 0)
-
-            if Config.Debug then
-                print('[GHR CLIENT] Configured ped netId=' .. entry.netId)
-            end
-        else
-            if Config.Debug then
-                print('[GHR CLIENT] Could not resolve netId=' .. tostring(entry.netId))
-            end
-        end
-    end
-end)
-
--- =============================================
--- NET EVENT: DRIVE ESCAPE VEHICLE
--- Server creates the vehicle and driver, sends
--- us the driver's netId. We apply the drive
--- task since TaskVehicleDriveToCoord is client.
--- =============================================
-RegisterNetEvent('gang_hideout:driveEscapeVehicle', function(driverNetId, destX, destY, destZ)
-    Wait(1000)
-
-    local driver  = nil
-    local timeout = 0
-    repeat
-        Wait(200)
-        timeout = timeout + 200
-        if NetworkDoesNetworkIdExist(driverNetId) then
-            driver = NetworkGetEntityFromNetworkId(driverNetId)
-        end
-    until (driver and DoesEntityExist(driver)) or timeout > 5000
-
-    if not (driver and DoesEntityExist(driver)) then return end
-
-    local veh = GetVehiclePedIsIn(driver, false)
-    if not DoesEntityExist(veh) then return end
-
-    -- Set up hostility
-    local groupHash  = GetHashKey('HIDEOUT_GUARDS')
-    local playerHash = GetHashKey('PLAYER')
-    if not HasRelationshipGroupWithHash(groupHash) then AddRelationshipGroup('HIDEOUT_GUARDS') end
-    SetRelationshipBetweenGroups(5, groupHash, playerHash)
-    SetRelationshipBetweenGroups(5, playerHash, groupHash)
-    SetPedRelationshipGroupHash(driver, groupHash)
-    SetPedAsEnemy(driver, true)
-
-    TaskVehicleDriveToCoordLongrange(driver, veh, destX, destY, destZ, 22.0, 262144, 5.0)
-end)
-
--- =============================================
--- NET EVENT: RAID FINISHED
--- =============================================
-RegisterNetEvent('gang_hideout:raidFinished', function()
-    raidActive = false
-    if activeBlip then RemoveBlip(activeBlip); activeBlip = nil end
-    Notify('🏆 Raid complete! All enemies eliminated.', 'success')
-    -- Claim server bonus (each player can claim individually)
-    TriggerServerEvent('gang_hideout:claimBonus')
+    AddEntityTarget(ped, npc.targetLabel, "fas fa-skull-crossbones", 2.5, function()
+        TriggerServerEvent("gang_hideout:startRaid")
+    end)
 end)
