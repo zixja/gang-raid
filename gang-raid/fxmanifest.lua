@@ -3,7 +3,7 @@ game 'gta5'
 
 description 'Gang Hideout Raid - Wave-based, Multi-location, QBCore/QBox/ox compatible'
 author 'Zix'
-version '1.0.0'
+version '5.0.0'
 
 shared_script 'config.lua'
 
