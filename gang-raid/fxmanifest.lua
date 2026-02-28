@@ -1,9 +1,10 @@
 fx_version 'cerulean'
 game 'gta5'
+lua54 'yes'
 
-description 'Gang Hideout Raid - Wave-based, Multi-location, QBCore/QBox/ox compatible'
-author 'Zix'
-version '5.0.0'
+description 'Gang Hideout Raid - Wave-based, Multi-location, QBCore/QBox/OX'
+author      'Zix'
+version     '1.0.0'
 
 shared_script 'config.lua'
 
@@ -15,14 +16,12 @@ server_scripts {
     'server.lua'
 }
 
--- Hard dependency: one of these must be running
 dependencies {
-    '/onesync',
     'qb-core',
 }
 
--- Optional dependencies (script works without them but features degrade):
--- qb-target  OR  ox_target   → entity interactions
--- ox_inventory               → inventory fallback
--- ps-dispatch                → police alerts
--- ox_lib                     → notify fallback
+-- Optional (script works without these, features degrade gracefully):
+-- 'qb-target'    or 'ox_target'    — entity interactions (REQUIRED in practice)
+-- 'ox_lib'                          — skillcheck, progressbar, notify
+-- 'ox_inventory'                    — falls back to qb-inventory if absent
+-- 'ps-dispatch'                     — police alerts on raid start
