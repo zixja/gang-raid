@@ -1,16 +1,18 @@
 -- =============================================
--- GANG HIDEOUT RAID | client.lua  v5.0
+-- GANG HIDEOUT RAID | client.lua  v6.0
 -- Supports: qb-target / ox_target (auto-detect)
 --           QBCore / QBox / ox_lib notify
 -- =============================================
 
 local QBCore             = nil
 local lootedCrates       = {}
+local spawnedCrates      = {}   -- object handles so we can delete on cleanup
 local spawnedGuards      = {}   -- { ped = handle, looted = bool }
 local lootedGuards       = {}   -- [ped handle] = true
 local activeLocation     = nil
 local activeBlip         = nil
 local lootMonitorRunning = false
+local aiLoopRunning      = false
 
 -- Init QBCore if available
 local ok, obj = pcall(function() return exports['qb-core']:GetCoreObject() end)
@@ -88,9 +90,80 @@ local function RemoveEntityTarget(entity)
 end
 
 -- =============================================
+-- EMOTE HELPER
+-- =============================================
+local function PlayEmote(scenario)
+    local playerPed = PlayerPedId()
+    if scenario then
+        TaskStartScenarioInPlace(playerPed, scenario, 0, true)
+    else
+        -- ClearPedTasksImmediately forcefully exits any active scenario
+        -- ClearPedTasks alone queues the stop but the scenario can persist
+        ClearPedTasksImmediately(PlayerPedId())
+    end
+end
+
+-- =============================================
+-- OX_LIB SKILLCHECK + PROGRESSBAR LOOT SEQUENCE
+--
+-- Flow:
+--   1. Skillcheck pops (must pass to continue)
+--   2. Emote starts
+--   3. Progress bar runs — player can press E/Backspace to cancel
+--   4. Emote always cleared on exit regardless of outcome
+--
+-- NOTE: We do NOT pass anim.scenario to the progressBar.
+-- Letting ox_lib manage the animation internally conflicts
+-- with our manual scenario task and prevents clean cancellation.
+-- The scenario is started before the bar and cleared after.
+-- =============================================
+local function DoLootSequence(params)
+    local hasOxLib = GetResourceState('ox_lib') == 'started'
+
+    if not hasOxLib then
+        params.onSuccess()
+        return
+    end
+
+    -- 1. Skillcheck first (no emote yet — looks weird to animate before passing)
+    local passed = exports['ox_lib']:skillCheck({ 'easy', 'medium' }, { 'e' })
+
+    if not passed then
+        Notify('You failed the check.', 'error')
+        if params.onFail then params.onFail() end
+        return
+    end
+
+    -- 2. Start emote AFTER passing skillcheck
+    PlayEmote(params.emote)
+
+    -- 3. Progress bar — NO anim block so ox_lib doesn't fight our scenario
+    local completed = exports['ox_lib']:progressBar({
+        duration     = params.duration or 4000,
+        label        = params.progressLabel or 'Searching...',
+        useWhileDead = false,
+        canCancel    = true,
+        disable = {
+            move   = true,
+            car    = true,
+            combat = true,
+            sprint = true,
+        },
+    })
+
+    -- 4. Always clear emote immediately when bar finishes or is cancelled
+    ClearPedTasksImmediately(PlayerPedId())
+
+    if completed then
+        params.onSuccess()
+    else
+        Notify('Interrupted.', 'error')
+        if params.onFail then params.onFail() end
+    end
+end
+
+-- =============================================
 -- GUARD RELATIONSHIPS
--- GTA relationship groups are client-local, so
--- this must run on every player's machine.
 -- =============================================
 local function SetupGuardRelationships()
     local groupName   = "HIDEOUT_GUARDS"
@@ -108,10 +181,6 @@ end
 
 -- =============================================
 -- APPLY COMBAT SETTINGS
--- Combat attribute 14 = attack player on sight
--- Combat attribute 52 = attack when spotted
--- SetPedAlertness(3)  = fully combat-alerted
--- These three together make guards shoot first.
 -- =============================================
 local function ApplyCombatSettings(ped, groupHash)
     SetPedRelationshipGroupHash(ped, groupHash)
@@ -121,10 +190,10 @@ local function ApplyCombatSettings(ped, groupHash)
     SetPedCombatAttributes(ped, 0,  true)
     SetPedCombatAttributes(ped, 2,  true)
     SetPedCombatAttributes(ped, 5,  true)
-    SetPedCombatAttributes(ped, 14, true)  -- attack player on sight (KEY)
+    SetPedCombatAttributes(ped, 14, true)
     SetPedCombatAttributes(ped, 17, true)
     SetPedCombatAttributes(ped, 46, true)
-    SetPedCombatAttributes(ped, 52, true)  -- attack when spotted (KEY)
+    SetPedCombatAttributes(ped, 52, true)
 
     SetPedCombatRange(ped, 2)
     SetPedCombatAbility(ped, 2)
@@ -133,14 +202,69 @@ local function ApplyCombatSettings(ped, groupHash)
     SetBlockingOfNonTemporaryEvents(ped, true)
     SetPedFleeAttributes(ped, 0, false)
     SetPedDiesWhenInjured(ped, false)
-
-    TaskCombatHatedTargetsAroundPed(ped, 60.0, 0)
+    SetPedTargetLossResponse(ped, 2)
 end
 
 -- =============================================
--- LOOT MONITOR
--- Watches spawnedGuards every second for newly
--- dead peds, then adds a Search Body target.
+-- GUARD AI LOOP
+-- =============================================
+local function RequestPedControl(ped)
+    if NetworkHasControlOfEntity(ped) then return true end
+    NetworkRequestControlOfEntity(ped)
+    local t = 0
+    while not NetworkHasControlOfEntity(ped) and t < 1000 do
+        Wait(50)
+        t = t + 50
+        NetworkRequestControlOfEntity(ped)
+    end
+    return NetworkHasControlOfEntity(ped)
+end
+
+local function TaskGuardCombat(ped)
+    local pedCoords     = GetEntityCoords(ped)
+    local closestPlayer = nil
+    local closestDist   = 80.0
+
+    for _, playerId in ipairs(GetActivePlayers()) do
+        local playerPed = GetPlayerPed(playerId)
+        if DoesEntityExist(playerPed) and not IsEntityDead(playerPed) then
+            local dist = #(pedCoords - GetEntityCoords(playerPed))
+            if dist < closestDist then
+                closestDist   = dist
+                closestPlayer = playerPed
+            end
+        end
+    end
+
+    if closestPlayer then
+        TaskCombatPed(ped, closestPlayer, 0, 16)
+    else
+        TaskCombatHatedTargetsAroundPed(ped, 80.0, 0)
+    end
+end
+
+local function StartGuardAILoop()
+    if aiLoopRunning then return end
+    aiLoopRunning = true
+
+    CreateThread(function()
+        while aiLoopRunning do
+            Wait(1500)
+
+            for _, entry in ipairs(spawnedGuards) do
+                local ped = entry.ped
+                if not DoesEntityExist(ped) or IsEntityDead(ped) then goto continue end
+                if RequestPedControl(ped) then
+                    TaskGuardCombat(ped)
+                end
+                ::continue::
+            end
+        end
+    end)
+end
+
+-- =============================================
+-- LOOT MONITOR — watches for dead guards
 -- =============================================
 local function StartLootMonitor()
     if lootMonitorRunning then return end
@@ -165,7 +289,22 @@ local function StartLootMonitor()
                         if not DoesEntityExist(p) then return end
                         AddEntityTarget(p, "Search Body", "fas fa-search", 1.5, function(entity)
                             RemoveEntityTarget(entity)
-                            TriggerServerEvent("gang_hideout:lootGuard")
+
+                            DoLootSequence({
+                                emote         = 'CODE_HUMAN_MEDIC_KNEEL',  -- kneeling over body
+                                progressLabel = 'Searching body...',
+                                duration      = 5000,
+                                onSuccess     = function()
+                                    TriggerServerEvent("gang_hideout:lootGuard")
+                                end,
+                                onFail = function()
+                                    -- Re-add target so player can try again
+                                    if DoesEntityExist(p) then
+                                        lootedGuards[p]  = nil
+                                        entry.looted     = false
+                                    end
+                                end,
+                            })
                         end)
                     end)
                 end
@@ -175,17 +314,32 @@ local function StartLootMonitor()
 end
 
 -- =============================================
--- RAID STARTED — fires on ALL clients
+-- BLIP HELPER — safe remove + create
+-- Uses both the stored handle AND a full blip
+-- sweep by sprite so stale handles never leave
+-- a ghost blip on the map.
 -- =============================================
-RegisterNetEvent('gang_hideout:raidStarted', function(locationIndex)
-    lootedCrates       = {}
-    lootedGuards       = {}
-    spawnedGuards      = {}
-    lootMonitorRunning = false
-    activeLocation     = Config.Locations[locationIndex]
+local RAID_BLIP_SPRITE = 161  -- matches all locations in config
 
-    if activeBlip then RemoveBlip(activeBlip) end
-    local b    = activeLocation.blip
+local function ClearRaidBlip()
+    -- Remove by stored handle first
+    if activeBlip and DoesBlipExist(activeBlip) then
+        RemoveBlip(activeBlip)
+    end
+    activeBlip = nil
+
+    -- Safety sweep: remove every blip with the raid sprite
+    -- This catches any orphaned blips from previous raids
+    -- or blips whose handle was lost between events.
+    local blip = GetFirstBlipInfoId(RAID_BLIP_SPRITE)
+    while DoesBlipExist(blip) do
+        RemoveBlip(blip)
+        blip = GetNextBlipInfoId(RAID_BLIP_SPRITE)
+    end
+end
+
+local function CreateRaidBlip(b)
+    ClearRaidBlip()
     activeBlip = AddBlipForCoord(b.coords)
     SetBlipSprite(activeBlip, b.sprite)
     SetBlipScale(activeBlip, b.scale)
@@ -195,6 +349,22 @@ RegisterNetEvent('gang_hideout:raidStarted', function(locationIndex)
     BeginTextCommandSetBlipName("STRING")
     AddTextComponentString(b.label)
     EndTextCommandSetBlipName(activeBlip)
+    RAID_BLIP_SPRITE = b.sprite  -- keep in sync in case config changes it
+end
+
+-- =============================================
+-- RAID STARTED — fires on ALL clients
+-- =============================================
+RegisterNetEvent('gang_hideout:raidStarted', function(locationIndex)
+    lootedCrates       = {}
+    spawnedCrates      = {}
+    lootedGuards       = {}
+    spawnedGuards      = {}
+    lootMonitorRunning = false
+    aiLoopRunning      = false
+    activeLocation     = Config.Locations[locationIndex]
+
+    CreateRaidBlip(activeLocation.blip)
 
     for i, coords in pairs(activeLocation.lootCrates) do
         local crateId = "crate_" .. i
@@ -202,16 +372,26 @@ RegisterNetEvent('gang_hideout:raidStarted', function(locationIndex)
         SetEntityAsMissionEntity(obj, true, true)
         FreezeEntityPosition(obj, true)
         PlaceObjectOnGroundProperly(obj)
+        table.insert(spawnedCrates, obj)  -- track for cleanup on raid end
 
         AddEntityTarget(obj, "Search Crate", "fas fa-box-open", 2.0, function(entity)
             if lootedCrates[crateId] then
                 Notify("This crate is already empty.", "error")
                 return
             end
-            lootedCrates[crateId] = true
-            TriggerServerEvent("gang_hideout:giveLoot")
-            RemoveEntityTarget(entity)
-            DeleteEntity(entity)
+
+            DoLootSequence({
+                emote         = 'PROP_HUMAN_BUM_BIN',   -- rummaging through a container
+                progressLabel = 'Searching crate...',
+                duration      = 6000,
+                onSuccess     = function()
+                    lootedCrates[crateId] = true
+                    TriggerServerEvent("gang_hideout:giveLoot")
+                    RemoveEntityTarget(entity)
+                    DeleteEntity(entity)
+                end,
+                -- onFail: do nothing, player can try again
+            })
         end)
     end
 
@@ -243,8 +423,9 @@ RegisterNetEvent('gang_hideout:spawnWave', function(guards, waveNum)
         SetPedAccuracy(ped, guard.accuracy or 70)
 
         ApplyCombatSettings(ped, groupHash)
-        SetModelAsNoLongerNeeded(model)
+        TaskGuardCombat(ped)
 
+        SetModelAsNoLongerNeeded(model)
         table.insert(spawnedGuards, { ped = ped, looted = false })
 
         local timeout = 0
@@ -262,6 +443,7 @@ RegisterNetEvent('gang_hideout:spawnWave', function(guards, waveNum)
 
     TriggerServerEvent('gang_hideout:waveSpawned', netIds)
     StartLootMonitor()
+    StartGuardAILoop()
     Notify('Wave ' .. waveNum .. ' — enemies inbound!', 'error')
 
     if Config.Debug then print('[gang-raid] Wave ' .. waveNum .. ' spawned ' .. #netIds .. ' peds.') end
@@ -358,12 +540,83 @@ end)
 -- =============================================
 -- RAID FINISHED — all clients
 -- =============================================
-RegisterNetEvent('gang_hideout:raidFinished', function()
+-- =============================================
+-- FULL RAID CLEANUP
+-- Deletes all client-side entities (crates, guards)
+-- and removes the blip. Called on raidFinished and
+-- also exported so server can trigger it directly.
+-- =============================================
+local function CleanupRaid()
     lootMonitorRunning = false
-    if activeBlip then RemoveBlip(activeBlip) activeBlip = nil end
+    aiLoopRunning      = false
+
+    -- Delete remaining crate props
+    for _, obj in ipairs(spawnedCrates) do
+        if DoesEntityExist(obj) then
+            RemoveEntityTarget(obj)
+            SetEntityAsMissionEntity(obj, false, true)
+            DeleteObject(obj)
+        end
+    end
+    spawnedCrates = {}
+    lootedCrates  = {}
+
+    -- Delete remaining guard peds
+    for _, entry in ipairs(spawnedGuards) do
+        local ped = entry.ped
+        if DoesEntityExist(ped) then
+            RemoveEntityTarget(ped)
+            SetEntityAsMissionEntity(ped, false, true)
+            DeleteEntity(ped)
+        end
+    end
+    spawnedGuards = {}
+    lootedGuards  = {}
+
+    -- Blip: remove by handle + full sprite sweep, retried 3 times
+    -- to handle stale handles and late-resolving blip state
+    local function WipeBlip()
+        if activeBlip and DoesBlipExist(activeBlip) then
+            RemoveBlip(activeBlip)
+        end
+        activeBlip = nil
+        local b = GetFirstBlipInfoId(RAID_BLIP_SPRITE)
+        while DoesBlipExist(b) do
+            RemoveBlip(b)
+            b = GetNextBlipInfoId(RAID_BLIP_SPRITE)
+        end
+    end
+
+    WipeBlip()
+    SetTimeout(500,  WipeBlip)
+    SetTimeout(1500, WipeBlip)
+    SetTimeout(4000, WipeBlip)
+
+    activeLocation = nil
+end
+
+RegisterNetEvent('gang_hideout:raidFinished', function()
+    CleanupRaid()
     Notify('Gang hideout cleared! Check your inventory for your bonus.', 'success')
     TriggerServerEvent('gang_hideout:claimBonus')
-    activeLocation = nil
+end)
+
+-- =============================================
+-- CLEANUP DEAD PEDS — all clients
+-- Called 30s after each wave is cleared so
+-- corpses don't litter the area forever.
+-- =============================================
+RegisterNetEvent('gang_hideout:cleanupPeds', function(netIds)
+    for _, netId in ipairs(netIds) do
+        if NetworkDoesEntityExistWithNetworkId(netId) then
+            local ped = NetworkGetEntityFromNetworkId(netId)
+            if DoesEntityExist(ped) and not IsPedAPlayer(ped) then
+                RemoveEntityTarget(ped)
+                SetEntityAsMissionEntity(ped, false, true)
+                DeleteEntity(ped)
+            end
+        end
+    end
 end)
 
 -- =============================================
