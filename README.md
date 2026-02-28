@@ -48,7 +48,7 @@
 3. **Add** the following to your `server.cfg`:
 
 ```cfg
-ensure gang_hideout_raid
+ensure gang-raid
 ```
 
 4. **Make sure** your dependencies are started **before** this resource:
