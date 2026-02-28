@@ -2,6 +2,81 @@
 -- GANG HIDEOUT RAID | server.lua  v5.0
 -- =============================================
 
+-- =============================================
+-- VERSION CHECKER
+-- Compares local version (fxmanifest.lua) against
+-- the latest published GitHub Release tag.
+--
+-- REQUIREMENTS:
+--   1. Your repo must have at least one published
+--      Release on GitHub (not just a tag).
+--   2. FiveM must be able to reach api.github.com.
+--      If you use a firewall/txAdmin, ensure outbound
+--      HTTPS is not blocked for server resources.
+-- =============================================
+local GITHUB_REPO     = 'zixja/gang-raid'
+local RESOURCE_NAME   = GetCurrentResourceName()
+local CURRENT_VERSION = GetResourceMetadata(RESOURCE_NAME, 'version', 0) or '1.0.0'
+
+local function CheckVersion()
+    local url = 'https://api.github.com/repos/' .. GITHUB_REPO .. '/releases/latest'
+
+    print('^5[gang-raid] Checking for updates... (current: v' .. CURRENT_VERSION .. ')^7')
+
+    PerformHttpRequest(url, function(statusCode, response, headers)
+
+        -- No response at all — likely a firewall/network block
+        if not response or response == '' then
+            print('^3[gang-raid] Version check got no response. Is api.github.com reachable from your server?^7')
+            return
+        end
+
+        -- 404 = repo exists but has no published Releases yet
+        if statusCode == 404 then
+            print('^3[gang-raid] Version check: no releases found at github.com/' .. GITHUB_REPO .. '. Publish a Release on GitHub to enable update checking.^7')
+            return
+        end
+
+        if statusCode ~= 200 then
+            print('^3[gang-raid] Version check failed — HTTP ' .. tostring(statusCode) .. '^7')
+            return
+        end
+
+        -- Pull tag_name out of JSON — handles "v1.0.0" and "1.0.0"
+        local latestTag = response:match('"tag_name"%s*:%s*"([^"]+)"')
+        if not latestTag then
+            print('^3[gang-raid] Version check: could not parse tag from GitHub response.^7')
+            return
+        end
+
+        local latest  = latestTag:gsub('^[vV]', '')
+        local current = CURRENT_VERSION:gsub('^[vV]', '')
+
+        if current == latest then
+            print('^2[gang-raid] ✓ Up to date (v' .. current .. ')^7')
+        else
+            print(' ')
+            print('^1[ GANG RAID ] ═══════════════════════════════════^7')
+            print('^1  UPDATE AVAILABLE!^7')
+            print('^3  Running  : ^7v' .. current)
+            print('^2  Latest   : ^7v' .. latest)
+            print('^5  Download : ^7https://github.com/' .. GITHUB_REPO .. '/releases/latest')
+            print('^1═══════════════════════════════════════════════^7')
+            print(' ')
+        end
+
+    end, 'GET', '', {
+        ['User-Agent'] = 'FiveM/' .. RESOURCE_NAME .. '-version-check',
+        ['Accept']     = 'application/vnd.github+json',
+    })
+end
+
+-- Delay startup check so the server networking stack is fully ready
+CreateThread(function()
+    Wait(5000)
+    CheckVersion()
+end)
+
 local QBCore             = nil
 local raidActive         = false
 local raidCooldownEnd    = 0
@@ -162,11 +237,19 @@ local function StartWaveMonitor()
                 end
             end
 
-            -- Clean up corpses after a delay (gives players time to loot)
+            -- Tell all clients to delete these dead peds locally
+            -- Server-side DeleteEntity is unreliable for client-spawned networked peds
+            local deadNetIds = {}
             for _, deadPed in ipairs(toDelete) do
-                local p = deadPed
+                local netId = NetworkGetNetworkIdFromEntity(deadPed)
+                if netId and netId ~= 0 then
+                    table.insert(deadNetIds, netId)
+                end
+            end
+            if #deadNetIds > 0 then
+                -- Small delay so players have time to loot before peds disappear
                 SetTimeout(30000, function()
-                    if DoesEntityExist(p) then DeleteEntity(p) end
+                    TriggerClientEvent('gang_hideout:cleanupPeds', -1, deadNetIds)
                 end)
             end
 
@@ -177,7 +260,11 @@ local function StartWaveMonitor()
                 if currentWave > Config.MaxWaves then
                     raidActive         = false
                     waveMonitorRunning = false
-                    TriggerClientEvent('gang_hideout:raidFinished', -1)
+                    -- Small delay before raidFinished so loot monitor has time
+                    -- to register the last kill before cleanup wipes the ped list
+                    SetTimeout(2000, function()
+                        TriggerClientEvent('gang_hideout:raidFinished', -1)
+                    end)
                     if Config.Debug then print('[gang-raid] Raid complete.') end
                     return
                 else
