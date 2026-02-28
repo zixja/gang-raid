@@ -152,13 +152,13 @@ Config.Locations = {
 -- LOOT TABLE
 -- =============================================
 Config.LootTable = {
-    { name = "markedmoney", amount = { min = 200, max = 800 }, chance = 60 },
-    { name = "cokebaggy",   amount = { min = 1,   max = 3   }, chance = 25 },
-    { name = "weed_ogkush", amount = { min = 1,   max = 5   }, chance = 30 },
+    { name = "black_money", amount = { min = 200, max = 800 }, chance = 60 },
+    { name = "weapon_pistol",   amount = { min = 1,   max = 3   }, chance = 25 },
+    { name = "joint", amount = { min = 1,   max = 5   }, chance = 30 },
     { name = "lockpick",    amount = { min = 1,   max = 2   }, chance = 20 },
     { name = "armor",       amount = { min = 1,   max = 1   }, chance = 15 },
     -- Weapon ammo boxes (won't add actual weapon to inv unless you have item defined)
-    { name = "pistol_ammo", amount = { min = 20,  max = 50  }, chance = 35 },
+    { name = "ammo-9", amount = { min = 20,  max = 50  }, chance = 35 },
 }
 
 -- =============================================
