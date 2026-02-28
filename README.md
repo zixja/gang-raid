@@ -44,7 +44,7 @@
 ## 📦 Installation
 
 1. **Download** or clone this repository
-2. **Place** the `gang_hideout_raid` folder inside your server's `resources` directory
+2. **Place** the `gang-raid` folder inside your server's `resources` directory
 3. **Add** the following to your `server.cfg`:
 
 ```cfg
